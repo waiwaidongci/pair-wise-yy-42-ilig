@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, NotFoundError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
+from .rules import (AUDIT_ROLES, BATCH_ROLES, CREATE_ROLES, ENTITY, OBS_FIRELINE,
+                    OBS_WIND, PERMIT_ROLES, RECORD_ROLES, REVIEW_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+                    judge_conditions, merge_observations, priority_score,
+                    response_deadline_hours, role_for_transition,
+                    validate_observations, validate_ticket_no, validate_transition)
 
 
 class Service:
@@ -90,6 +93,180 @@ class Service:
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
+
+    # ------------------------------------------------------------------
+    # 观测批次（现场单号识别、整批保留、按现场时刻合并、冲突待复核）
+    # ------------------------------------------------------------------
+    def _build_plan(self, item: Dict[str, Any], observations: list) -> Dict[str, Any]:
+        """依据判定规则生成批次应用计划。观测判定在 rules，批次存储在 repository。"""
+        history = self.repository.history_observations(item["id"])
+        merged = merge_observations(history, observations)
+        conflict_resources = {c["resource"] for c in merged["resource_conflicts"]}
+        resources_to_apply = {
+            res: action for res, action in merged["resources"].items()
+            if res not in conflict_resources
+        }
+        invalidate = any(o["kind"] in (OBS_WIND, OBS_FIRELINE) for o in observations)
+        review_pending = merged["has_conflict"]
+        return {
+            "wind_direction": merged["wind_direction"],
+            "fire_line_length": merged["fire_line_length"],
+            "review_pending": review_pending,
+            "invalidate": invalidate,
+            "resources": resources_to_apply,
+            "batch_status": "review" if review_pending else "applied",
+            "result": {"merged": merged, "review_pending": review_pending},
+        }
+
+    def _apply_batch(self, batch: Dict[str, Any], observations: list) -> Dict[str, Any]:
+        item = self.repository.get_item(batch["item_id"])
+        plan = self._build_plan(item, observations)
+        try:
+            applied = self.repository.apply_batch_transaction(batch["id"], item["id"], plan)
+        except Exception as exc:
+            self.repository.mark_batch_failed(batch["id"], str(exc))
+            self.repository.append_audit("batch_failed", ENTITY, item["id"], batch["actor"], {
+                "ticket_no": batch["ticket_no"], "error": str(exc)[:300],
+            })
+            failed = self.repository.get_batch_by_ticket(batch["ticket_no"])
+            return failed  # type: ignore[return-value]
+        self.repository.append_audit("batch_apply", ENTITY, item["id"], batch["actor"], {
+            "ticket_no": batch["ticket_no"], "status": applied["status"],
+            "review_pending": plan["review_pending"],
+            "invalidate": plan["invalidate"],
+        })
+        return applied
+
+    def submit_batch(self, item_id: int, ticket_no: str, observations: list,
+                     actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, BATCH_ROLES)
+        actor = require_text(actor, "actor", 100)
+        ticket_no = validate_ticket_no(ticket_no)
+        observations = validate_observations(observations)
+        self.repository.get_item(item_id)
+        existing = self.repository.get_batch_by_ticket(ticket_no)
+        if existing is not None:
+            if existing["item_id"] != item_id:
+                from .domain import ConflictError
+                raise ConflictError("现场单号已属于其他任务区")
+            # 同号重放：沿用首次结果，不重复应用
+            if existing["status"] == "applied":
+                return existing
+            if existing["status"] == "review":
+                return existing
+            # failed/pending：整批保留，恢复后再试
+            return self._apply_batch(existing, existing["observations"])
+        batch = self.repository.create_batch(ticket_no, item_id, observations, actor)
+        return self._apply_batch(batch, observations)
+
+    def retry_batch(self, ticket_no: str, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, BATCH_ROLES)
+        actor = require_text(actor, "actor", 100)
+        ticket_no = validate_ticket_no(ticket_no)
+        batch = self.repository.get_batch_by_ticket(ticket_no)
+        if batch is None:
+            from .domain import NotFoundError
+            raise NotFoundError("批次不存在")
+        if batch["status"] == "applied":
+            return batch
+        if batch["status"] == "review":
+            return batch
+        return self._apply_batch(batch, batch["observations"])
+
+    def review_batch(self, batch_id: int, choices: Dict[str, str],
+                     actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        if not isinstance(choices, dict):
+            raise ValidationError("复核结论必须是对象")
+        batch = self.repository.get_batch(batch_id)
+        if batch is None:
+            from .domain import NotFoundError
+            raise NotFoundError("批次不存在")
+        if batch["status"] != "review":
+            from .domain import ConflictError
+            raise ConflictError("批次不在待复核状态")
+        merged = batch["result"]["merged"]
+        fire_conflict = merged["fire_line_conflict"]
+        resource_conflicts = merged["resource_conflicts"]
+        resolved_fire = merged["fire_line_length"]
+        if fire_conflict is not None:
+            side = choices.get("fire_line_length")
+            if side not in ("online", "offline"):
+                raise ValidationError("火线冲突需选择online或offline")
+            resolved_fire = fire_conflict[side]
+        resolved_resources = dict(merged["resources"])
+        for conflict in resource_conflicts:
+            key = "resource:" + conflict["resource"]
+            side = choices.get(key)
+            if side not in ("online", "offline"):
+                raise ValidationError(f"资源{conflict['resource']}冲突需选择online或offline")
+            resolved_resources[conflict["resource"]] = conflict[side]
+        plan = {
+            "wind_direction": merged["wind_direction"],
+            "fire_line_length": resolved_fire,
+            "invalidate": True,
+            "resources": resolved_resources,
+            "result": {"merged": merged, "resolution": choices, "review_pending": False},
+        }
+        reviewed = self.repository.review_batch_transaction(batch_id, batch["item_id"],
+                                                            plan, actor)
+        self.repository.append_audit("batch_review", ENTITY, batch["item_id"], actor, {
+            "ticket_no": batch["ticket_no"], "choices": choices,
+        })
+        return reviewed
+
+    def list_batches(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_batches(item_id)
+
+    # ------------------------------------------------------------------
+    # 处置许可（按新值重算，复核前挡住重新放行）
+    # ------------------------------------------------------------------
+    def issue_permit(self, item_id: int, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, PERMIT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        item = self.repository.get_item(item_id)
+        if item.get("review_pending"):
+            from .domain import ConflictError
+            raise ConflictError("复核完成前禁止重新放行")
+        if self.repository.get_active_permit(item_id) is not None:
+            from .domain import ConflictError
+            raise ConflictError("已有有效许可")
+        conditions = judge_conditions(item.get("wind_direction"), item["quantity"],
+                                      item["severity"], item["threshold"])
+        permit = self.repository.create_permit(item_id, item["version"],
+                                               item.get("wind_direction"), item["quantity"],
+                                               conditions, actor)
+        self.repository.append_audit("permit_issue", ENTITY, item_id, actor, {
+            "permit_id": permit["id"], "basis_version": item["version"],
+            "conditions": conditions,
+        })
+        return permit
+
+    def list_permits(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_permits(item_id)
+
+    def release_permit(self, permit_id: int, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, PERMIT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        permit = self.repository.release_permit(permit_id)
+        if permit is None:
+            from .domain import ConflictError
+            raise ConflictError("许可不存在或已放行")
+        self.repository.append_audit("permit_release", ENTITY, permit["item_id"], actor, {
+            "permit_id": permit["id"],
+        })
+        return permit
+
+    def list_assignments(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_assignments(item_id)
+
+    def list_occupations(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_occupations(item_id)
 
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:

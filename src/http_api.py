@@ -76,6 +76,7 @@ def make_handler(service: Service, static_dir: str):
         def do_GET(self) -> None:
             try:
                 path = urlparse(self.path).path
+                segments = [s for s in path.split("/") if s != ""]
                 if path == "/health":
                     self._json(200, {"status": "ok"})
                 elif path == "/":
@@ -84,13 +85,33 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "records":
+                    item_id = int(segments[2])
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
-                elif path.startswith("/api/items/"):
-                    item_id = int(path.rsplit("/", 1)[-1])
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "batches":
+                    item_id = int(segments[2])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"batches": service.list_batches(item_id, role)})
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "permits":
+                    item_id = int(segments[2])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"permits": service.list_permits(item_id, role)})
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "assignments":
+                    item_id = int(segments[2])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"assignments": service.list_assignments(item_id, role)})
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "occupations":
+                    item_id = int(segments[2])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"occupations": service.list_occupations(item_id, role)})
+                elif len(segments) == 3 and segments[0] == "api" and segments[1] == "items":
+                    item_id = int(segments[2])
                     actor, role = self._identity()
                     del actor
                     self._json(200, service.get_item(item_id, role))
@@ -106,19 +127,39 @@ def make_handler(service: Service, static_dir: str):
         def do_POST(self) -> None:
             try:
                 path = urlparse(self.path).path
+                segments = [s for s in path.split("/") if s != ""]
                 actor, role = self._identity()
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "records":
+                    item_id = int(segments[2])
                     self._json(201, service.add_record(item_id, body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/transition"):
-                    item_id = int(path.split("/")[3])
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "transition":
+                    item_id = int(segments[2])
                     target = body.get("target")
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "batches":
+                    item_id = int(segments[2])
+                    ticket_no = body.get("ticket_no")
+                    observations = body.get("observations")
+                    self._json(201, service.submit_batch(
+                        item_id, ticket_no, observations, actor, role))
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "items" and segments[3] == "permits":
+                    item_id = int(segments[2])
+                    self._json(201, service.issue_permit(item_id, actor, role))
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "batches" and segments[3] == "retry":
+                    ticket_no = segments[2]
+                    self._json(200, service.retry_batch(ticket_no, actor, role))
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "batches" and segments[3] == "review":
+                    batch_id = int(segments[2])
+                    choices = body.get("choices", {})
+                    self._json(200, service.review_batch(batch_id, choices, actor, role))
+                elif len(segments) == 4 and segments[0] == "api" and segments[1] == "permits" and segments[3] == "release":
+                    permit_id = int(segments[2])
+                    self._json(200, service.release_permit(permit_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

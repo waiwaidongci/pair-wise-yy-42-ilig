@@ -65,7 +65,71 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS observation_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticket_no TEXT NOT NULL UNIQUE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','applied','failed','review')),
+                    observations TEXT NOT NULL,
+                    result TEXT,
+                    error TEXT,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS permits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','invalid','released')),
+                    basis_version INTEGER NOT NULL,
+                    wind_direction TEXT,
+                    fire_line_length REAL,
+                    conditions TEXT NOT NULL,
+                    issued_by TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    invalidated_at TEXT,
+                    reviewed INTEGER NOT NULL DEFAULT 0,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS resource_assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    resource TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'assigned'
+                        CHECK(status IN ('assigned','released')),
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(item_id, resource)
+                );
+                CREATE TABLE IF NOT EXISTS resource_occupations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    resource TEXT NOT NULL,
+                    permit_id INTEGER REFERENCES permits(id) ON DELETE SET NULL,
+                    status TEXT NOT NULL DEFAULT 'occupied'
+                        CHECK(status IN ('occupied','released')),
+                    occupied_at TEXT NOT NULL,
+                    released_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_occupations_resource_active
+                    ON resource_occupations(resource) WHERE status='occupied';
             """)
+        self._ensure_columns()
+
+    def _ensure_columns(self) -> None:
+        """为旧库补充任务区版本链所需列。"""
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(items)").fetchall()}
+        with self.conn:
+            if "wind_direction" not in existing:
+                self.conn.execute("ALTER TABLE items ADD COLUMN wind_direction TEXT")
+            if "review_pending" not in existing:
+                self.conn.execute(
+                    "ALTER TABLE items ADD COLUMN review_pending INTEGER NOT NULL DEFAULT 0")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -213,3 +277,263 @@ class Repository:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    # ------------------------------------------------------------------
+    # 观测批次（批次存储）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _batch(row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        if data.get("observations"):
+            data["observations"] = json.loads(data["observations"])
+        if data.get("result"):
+            data["result"] = json.loads(data["result"])
+        return data
+
+    def history_observations(self, item_id: int) -> List[Dict[str, Any]]:
+        """已应用批次中的全部观测，作为在线一侧历史。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT observations FROM observation_batches "
+                "WHERE item_id=? AND status='applied' ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        history: List[Dict[str, Any]] = []
+        for row in rows:
+            history.extend(json.loads(row["observations"]))
+        return history
+
+    def get_batch_by_ticket(self, ticket_no: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM observation_batches WHERE ticket_no=?", (ticket_no,)
+            ).fetchone()
+        return self._batch(row) if row else None
+
+    def get_batch(self, batch_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM observation_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+        return self._batch(row) if row else None
+
+    def create_batch(self, ticket_no: str, item_id: int,
+                     observations: List[Dict[str, Any]], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO observation_batches
+                   (ticket_no, item_id, status, observations, actor, created_at, attempts)
+                   VALUES(?,?,?,?,?,?,0)""",
+                (ticket_no, item_id, "pending", json.dumps(observations, ensure_ascii=False),
+                 actor, now),
+            )
+            batch_id = int(cur.lastrowid)
+        return self.get_batch(batch_id)  # type: ignore[return-value]
+
+    def list_batches(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM observation_batches WHERE item_id=? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [self._batch(row) for row in rows]
+
+    def mark_batch_failed(self, batch_id: int, error: str) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE observation_batches SET status='failed', error=?, "
+                "attempts=attempts+1 WHERE id=?",
+                (error[:500], batch_id),
+            )
+
+    def apply_batch_transaction(self, batch_id: int, item_id: int,
+                                plan: Dict[str, Any]) -> Dict[str, Any]:
+        """整批应用：在一个事务内更新任务区版本、批次结果、许可与占用。
+
+        失败则整批回滚，不留下半条观测。plan 由 Service 依据判定规则生成。
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE items SET wind_direction=?, quantity=COALESCE(?, quantity),
+                   review_pending=?, version=version+1, updated_at=? WHERE id=?""",
+                (plan.get("wind_direction"), plan.get("fire_line_length"),
+                 1 if plan.get("review_pending") else 0, now, item_id),
+            )
+            self.conn.execute(
+                """UPDATE observation_batches SET status=?, result=?, error=NULL,
+                   applied_at=?, attempts=attempts+1 WHERE id=?""",
+                (plan["batch_status"], json.dumps(plan["result"], ensure_ascii=False),
+                 now, batch_id),
+            )
+            if plan.get("invalidate"):
+                self.conn.execute(
+                    "UPDATE permits SET status='invalid', invalidated_at=? "
+                    "WHERE item_id=? AND status='active'",
+                    (now, item_id),
+                )
+                self.conn.execute(
+                    "UPDATE resource_occupations SET status='released', released_at=? "
+                    "WHERE item_id=? AND status='occupied'",
+                    (now, item_id),
+                )
+            self._apply_resources(item_id, plan.get("resources", {}),
+                                  plan.get("invalidate", False), now)
+        return self.get_batch(batch_id)  # type: ignore[return-value]
+
+    def review_batch_transaction(self, batch_id: int, item_id: int,
+                                 plan: Dict[str, Any], reviewer: str) -> Dict[str, Any]:
+        """复核后按选定值落定合并结果，同样在一个事务内完成。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE items SET wind_direction=?, quantity=COALESCE(?, quantity),
+                   review_pending=0, version=version+1, updated_at=? WHERE id=?""",
+                (plan.get("wind_direction"), plan.get("fire_line_length"), now, item_id),
+            )
+            self.conn.execute(
+                """UPDATE observation_batches SET status='applied', result=?, error=NULL,
+                   applied_at=?, reviewed_by=?, reviewed_at=? WHERE id=?""",
+                (json.dumps(plan["result"], ensure_ascii=False), now, reviewer, now, batch_id),
+            )
+            self.conn.execute(
+                "UPDATE permits SET status='invalid', invalidated_at=? "
+                "WHERE item_id=? AND status='active'",
+                (now, item_id),
+            )
+            self.conn.execute(
+                "UPDATE resource_occupations SET status='released', released_at=? "
+                "WHERE item_id=? AND status='occupied'",
+                (now, item_id),
+            )
+            self._apply_resources(item_id, plan.get("resources", {}), True, now)
+        return self.get_batch(batch_id)  # type: ignore[return-value]
+
+    def _apply_resources(self, item_id: int, resources: Dict[str, str],
+                         invalidated: bool, now: str) -> None:
+        """更新资源编入/撤出状态，并联动占用。须在事务内调用。"""
+        active = self.conn.execute(
+            "SELECT id FROM permits WHERE item_id=? AND status='active' LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        for resource, action in resources.items():
+            status = "assigned" if action == "assign" else "released"
+            self.conn.execute(
+                """INSERT INTO resource_assignments(item_id, resource, status, updated_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(item_id, resource) DO UPDATE SET status=excluded.status,
+                   updated_at=excluded.updated_at""",
+                (item_id, resource, status, now),
+            )
+            if action == "assign" and active is not None and not invalidated:
+                self.conn.execute(
+                    """INSERT INTO resource_occupations(item_id, resource, permit_id,
+                       status, occupied_at)
+                       SELECT ?,?,?,?,'occupied'
+                       WHERE NOT EXISTS(
+                           SELECT 1 FROM resource_occupations
+                           WHERE resource=? AND status='occupied')""",
+                    (item_id, resource, active["id"], now, resource),
+                )
+            elif action == "release":
+                self.conn.execute(
+                    "UPDATE resource_occupations SET status='released', released_at=? "
+                    "WHERE item_id=? AND resource=? AND status='occupied'",
+                    (now, item_id, resource),
+                )
+
+    # ------------------------------------------------------------------
+    # 处置许可
+    # ------------------------------------------------------------------
+    def get_active_permit(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM permits WHERE item_id=? AND status='active' "
+                "ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return self._permit(row) if row else None
+
+    def get_permit(self, permit_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM permits WHERE id=?", (permit_id,)).fetchone()
+        return self._permit(row) if row else None
+
+    @staticmethod
+    def _permit(row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        if data.get("conditions"):
+            data["conditions"] = json.loads(data["conditions"])
+        return data
+
+    def create_permit(self, item_id: int, basis_version: int, wind_direction: Optional[str],
+                      fire_line_length: Optional[float], conditions: Dict[str, Any],
+                      actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO permits(item_id, status, basis_version, wind_direction,
+                   fire_line_length, conditions, issued_by, issued_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id, "active", basis_version, wind_direction, fire_line_length,
+                 json.dumps(conditions, ensure_ascii=False), actor, now),
+            )
+            permit_id = int(cur.lastrowid)
+            assignments = self.conn.execute(
+                "SELECT resource FROM resource_assignments "
+                "WHERE item_id=? AND status='assigned'",
+                (item_id,),
+            ).fetchall()
+            for row in assignments:
+                self.conn.execute(
+                    """INSERT INTO resource_occupations(item_id, resource, permit_id,
+                       status, occupied_at)
+                       SELECT ?,?,?,'occupied',?
+                       WHERE NOT EXISTS(
+                           SELECT 1 FROM resource_occupations
+                           WHERE resource=? AND status='occupied')""",
+                    (item_id, row["resource"], permit_id, now, row["resource"]),
+                )
+        return self.get_permit(permit_id)  # type: ignore[return-value]
+
+    def list_permits(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM permits WHERE item_id=? ORDER BY id DESC", (item_id,)
+            ).fetchall()
+        return [self._permit(row) for row in rows]
+
+    def release_permit(self, permit_id: int) -> Optional[Dict[str, Any]]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE permits SET status='released' WHERE id=? AND status='active'",
+                (permit_id,),
+            )
+            if cur.rowcount == 0:
+                return None
+            self.conn.execute(
+                "UPDATE resource_occupations SET status='released', released_at=? "
+                "WHERE permit_id=? AND status='occupied'",
+                (now, permit_id),
+            )
+        return self.get_permit(permit_id)
+
+    def list_assignments(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT resource, status FROM resource_assignments WHERE item_id=?",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_occupations(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT resource, status, permit_id FROM resource_occupations "
+                "WHERE item_id=? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
